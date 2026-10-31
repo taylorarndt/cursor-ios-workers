@@ -10,12 +10,15 @@
 #   ios-workers.sh start    Starts one background worker per iOS repo (default mode).
 #   ios-workers.sh stop     Stops only the workers this script started.
 #   ios-workers.sh status   Lists the workers this script started and whether they are running.
+#   ios-workers.sh install  Adds a LaunchAgent so "start" runs each time you log in.
+#   ios-workers.sh uninstall Removes that LaunchAgent. Running workers keep running until "stop".
 #   ios-workers.sh help     Shows this help.
 #
 # Written for macOS default tools: /bin/bash 3.2, BSD find, ps, git from Xcode or the
 # Command Line Tools. No sudo. It writes only to:
 #   ~/.config/ios-workers/        (exclude list you create, pid files)
-#   ~/Library/Logs/ios-workers/   (one log per worker)
+#   ~/Library/Logs/ios-workers/   (one log per worker, plus launchd.log)
+#   ~/Library/LaunchAgents/<label>.plist   (only with "install"; removed by "uninstall")
 #
 # Settings (environment variables, all optional):
 #   IOS_WORKERS_NAME          Machine name the workers register as.
@@ -27,6 +30,16 @@
 #                             "single": one worker process with every repo as a --worker-dir.
 #   SEARCH_ROOT               Folder to search for repos. Default $HOME.
 #                             (IOS_WORKERS_ROOT is still accepted as an older alias.)
+#   IOS_WORKERS_CLI           Full path to the Cursor CLI. Default: the first of "agent" or
+#                             "cursor-agent" found on PATH, in ~/.local/bin, /opt/homebrew/bin
+#                             or /usr/local/bin.
+#   IOS_WORKERS_IDLE_TIMEOUT  Passed as --idle-release-timeout. Default 3600 seconds. After
+#                             this long idle, the worker exits cleanly and the restart loop
+#                             starts a fresh one.
+#   IOS_WORKERS_LOOP          "1" (default) runs each worker inside a restart loop.
+#                             "0" runs the worker once, with no restart.
+#   IOS_WORKERS_LABEL         LaunchAgent label for install and uninstall.
+#   IOS_WORKERS_RESTART_DELAY Seconds to wait before a normal restart. Default 5.
 #
 # Cursor documentation this relies on (checked October 2026):
 #   https://cursor.com/docs/cloud-agent/self-hosted/my-machines
@@ -44,6 +57,10 @@
 #   - "agent status" (alias "agent whoami") shows whether you are signed in.
 #   - Install: curl https://cursor.com/install -fsS | bash   Sign in: agent login
 #   - Limit: 200 connected workers per user.
+#   - "--idle-release-timeout <seconds>": seconds the worker may stay connected after it
+#     becomes idle. The docs say the default is 0 (no idle release). The real CLI help
+#     (version 2026.10.22) says the default is 3600 and that the worker exits with code 0
+#     so a supervisor can restart it. This script always passes the value explicitly.
 #
 # NOT CONFIRMED by the docs (design choices, test them):
 #   - Whether several worker processes may share the same --name. The docs neither allow
@@ -57,10 +74,15 @@
 #     worker's process group, and SIGKILL only if it is still running after 15 seconds.
 #   - Whether a worker serves a repo whose .git is a file (worktree or submodule).
 #     Those are skipped.
+#   - The "cursor-agent" command name (installed by Homebrew) is not in Cursor's docs.
+#     It was seen on a real Mac and behaves like "agent".
+#   - The restart loop and the LaunchAgent are this project's own setup, not Cursor
+#     guidance. The docs only show launchd as an option for pool workers.
 
 set -u
 
 PROG="$(basename "$0")"
+SELF="$(cd "$(dirname "$0")" && pwd)/$PROG"
 ROOT="${SEARCH_ROOT:-${IOS_WORKERS_ROOT:-$HOME}}"
 MAX_DEPTH="${IOS_WORKERS_MAX_DEPTH:-6}"
 DETECT_DEPTH="${IOS_WORKERS_DETECT_DEPTH:-8}"
@@ -69,6 +91,16 @@ CONFIG_DIR="$HOME/.config/ios-workers"
 PID_DIR="$CONFIG_DIR/pids"
 EXCLUDE_FILE="$CONFIG_DIR/exclude"
 LOG_DIR="$HOME/Library/Logs/ios-workers"
+IDLE_TIMEOUT="${IOS_WORKERS_IDLE_TIMEOUT:-3600}"
+USE_LOOP="${IOS_WORKERS_LOOP:-1}"
+RESTART_DELAY="${IOS_WORKERS_RESTART_DELAY:-5}"
+FAST_FAIL_SECONDS=60      # A run shorter than this counts as a fast failure.
+MAX_BACKOFF_SECONDS=300   # Longest wait between restarts.
+MAX_FAST_FAILURES=20      # Give up after this many fast failures in a row.
+DEFAULT_LABEL="io.github.cursor-ios-workers"
+LABEL="${IOS_WORKERS_LABEL:-$DEFAULT_LABEL}"
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LAUNCHCTL="${IOS_WORKERS_LAUNCHCTL:-launchctl}"   # Test hook only.
 MAX_WORKERS=200
 STOP_WAIT_SECONDS=15
 
@@ -76,12 +108,14 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
 usage() {
-  say "Usage: $PROG scan | start | stop | status | help"
+  say "Usage: $PROG scan | start | stop | status | install | uninstall | help"
   say ""
   say "scan    List the iOS repos that would get a worker. Changes nothing."
   say "start   Start a Cursor My Machines worker for each iOS repo, in the background."
   say "stop    Stop only the workers this script started."
   say "status  List the workers this script started."
+  say "install    Add a LaunchAgent that runs start each time you log in."
+  say "uninstall  Remove that LaunchAgent. Workers keep running until you run stop."
 }
 
 is_number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
@@ -91,6 +125,14 @@ check_settings() {
     warn "Error: IOS_WORKERS_MAX_DEPTH and IOS_WORKERS_DETECT_DEPTH must be whole numbers."
     exit 2
   fi
+  if ! is_number "$IDLE_TIMEOUT" || ! is_number "$RESTART_DELAY"; then
+    warn "Error: IOS_WORKERS_IDLE_TIMEOUT and IOS_WORKERS_RESTART_DELAY must be whole numbers."
+    exit 2
+  fi
+  case "$USE_LOOP" in
+    0|1) ;;
+    *) warn "Error: IOS_WORKERS_LOOP must be 0 or 1. It is set to: $USE_LOOP"; exit 2 ;;
+  esac
   case "$MODE" in
     per-repo|single) ;;
     *) warn "Error: IOS_WORKERS_MODE must be per-repo or single. It is set to: $MODE"; exit 2 ;;
@@ -275,37 +317,57 @@ is_our_worker() {
   is_number "$pid" || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
-  case "$cmd" in *agent*worker*) return 0 ;; *) return 1 ;; esac
+  # Either the restart loop (this script with _run-loop) or a worker started directly.
+  case "$cmd" in *_run-loop*|*agent*worker*) return 0 ;; *) return 1 ;; esac
 }
 
+# Finds the Cursor CLI. Looks for "agent" first, then "cursor-agent".
 find_agent() {
-  if command -v agent >/dev/null 2>&1; then
-    command -v agent
-  elif [ -x "$HOME/.local/bin/agent" ]; then
-    printf '%s' "$HOME/.local/bin/agent"
+  local name dir
+  if [ -n "${IOS_WORKERS_CLI:-}" ]; then
+    [ -x "$IOS_WORKERS_CLI" ] && printf '%s' "$IOS_WORKERS_CLI"
+    return 0
   fi
+  for name in agent cursor-agent; do
+    if command -v "$name" >/dev/null 2>&1; then
+      command -v "$name"; return 0
+    fi
+    for dir in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+      if [ -x "$dir/$name" ]; then printf '%s' "$dir/$name"; return 0; fi
+    done
+  done
+  return 0
 }
 
 check_agent_ready() {
   AGENT="$(find_agent)"
   if [ -z "$AGENT" ]; then
-    say "The Cursor CLI (agent) is not installed, or is not on your PATH."
-    say "Nothing was started. To install it, run this yourself, then sign in:"
+    if [ -n "${IOS_WORKERS_CLI:-}" ]; then
+      say "IOS_WORKERS_CLI is set, but that file does not exist or is not executable:"
+      say "  $IOS_WORKERS_CLI"
+      say "Nothing was started or changed."
+      exit 4
+    fi
+    say "The Cursor CLI was not found. It is called agent or cursor-agent."
+    say "Looked on your PATH and in ~/.local/bin, /opt/homebrew/bin and /usr/local/bin."
+    say "Nothing was started or changed. To install it, run this yourself, then sign in:"
     say "  curl https://cursor.com/install -fsS | bash"
     say "  agent login"
-    say "If it is installed, add ~/.local/bin to your PATH and open a new Terminal window."
+    say "If your copy is called cursor-agent, sign in with: cursor-agent login"
+    say "If it is somewhere else, set IOS_WORKERS_CLI to its full path."
     exit 4
   fi
-  local out rc
+  local out rc cli_name
+  cli_name="${AGENT##*/}"
   out="$("$AGENT" status 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] || printf '%s' "$out" | grep -qiE 'not (authenticated|logged in|signed in)|logged out'; then
-    say "The Cursor CLI is installed but you are not signed in."
-    say "Nothing was started. Sign in by running:"
-    say "  agent login"
+    say "The Cursor CLI is installed at $AGENT but you are not signed in."
+    say "Nothing was started or changed. Sign in by running:"
+    say "  $cli_name login"
     exit 4
   fi
   unset out
-  say "Cursor CLI found and signed in."
+  say "Cursor CLI found at $AGENT and signed in."
 }
 
 ensure_dirs() {
@@ -332,7 +394,13 @@ launch_worker() {
   # set -m gives the background job its own process group, so stop can end
   # the worker and any child processes it starts, and nothing else.
   set -m
-  nohup "$AGENT" worker --name "$name" "$@" start >> "$log" 2>&1 < /dev/null &
+  if [ "$USE_LOOP" = "1" ]; then
+    nohup /bin/bash "$SELF" _run-loop "$AGENT" --name "$name" \
+      --idle-release-timeout "$IDLE_TIMEOUT" "$@" >> "$log" 2>&1 < /dev/null &
+  else
+    nohup "$AGENT" worker --name "$name" --idle-release-timeout "$IDLE_TIMEOUT" "$@" start \
+      >> "$log" 2>&1 < /dev/null &
+  fi
   pid=$!
   set +m
   printf '%s\n%s\n' "$pid" "$label" > "$pidfile"
@@ -345,6 +413,140 @@ launch_worker() {
     rm -f "$pidfile"
     return 1
   fi
+}
+
+# Internal. Runs one worker again and again until stopped.
+# Arguments: CLI path, then the worker options. Output goes to the worker's log.
+run_loop() {
+  local cli="$1"; shift
+  local child="" stopping=0 fast=0 rc started ran delay i
+  trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT HUP
+  while [ "$stopping" -eq 0 ]; do
+    started="$(date +%s)"
+    say "$(date '+%Y-%m-%d %H:%M:%S %Z') Starting worker."
+    "$cli" worker "$@" start &
+    child=$!
+    wait "$child"; rc=$?
+    # A signal interrupts wait. Wait again until the worker has really exited.
+    while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done
+    child=""
+    [ "$stopping" -eq 1 ] && break
+    ran=$(( $(date +%s) - started ))
+    if [ "$ran" -lt "$FAST_FAIL_SECONDS" ]; then
+      fast=$((fast + 1))
+      if [ "$fast" -ge "$MAX_FAST_FAILURES" ]; then
+        say "$(date '+%Y-%m-%d %H:%M:%S %Z') Worker failed $fast times in a row. Giving up. Run start again after fixing the problem."
+        exit 1
+      fi
+      delay="$RESTART_DELAY"; i=1
+      while [ "$i" -lt "$fast" ] && [ "$delay" -lt "$MAX_BACKOFF_SECONDS" ]; do
+        delay=$((delay * 2)); i=$((i + 1))
+      done
+      [ "$delay" -gt "$MAX_BACKOFF_SECONDS" ] && delay="$MAX_BACKOFF_SECONDS"
+    else
+      fast=0
+      delay="$RESTART_DELAY"
+    fi
+    say "$(date '+%Y-%m-%d %H:%M:%S %Z') Worker exited with code $rc after $ran seconds. Restarting in $delay seconds."
+    sleep "$delay" &
+    wait $! 2>/dev/null
+  done
+  say "$(date '+%Y-%m-%d %H:%M:%S %Z') Restart loop stopped."
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
+plist_path() { printf '%s/%s.plist' "$LAUNCH_AGENTS_DIR" "$LABEL"; }
+
+check_label() {
+  case "$LABEL" in
+    ''|*[!A-Za-z0-9._-]*) warn "Error: IOS_WORKERS_LABEL may use only letters, digits, dots, hyphens and underscores."; exit 2 ;;
+  esac
+}
+
+check_launchctl() {
+  if ! command -v "$LAUNCHCTL" >/dev/null 2>&1; then
+    warn "Error: launchctl was not found. install and uninstall work only on macOS."
+    exit 8
+  fi
+}
+
+# Writes the LaunchAgent. It runs "start" once at login. The workers then run on their
+# own, in their own process groups, so AbandonProcessGroup keeps launchd from ending them
+# when "start" finishes. Current settings are saved into the plist.
+write_plist() {
+  local file="$1" var val
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0">' '<dict>'
+    printf '  <key>Label</key>\n  <string>%s</string>\n' "$(xml_escape "$LABEL")"
+    printf '  <key>ProgramArguments</key>\n  <array>\n'
+    printf '    <string>/bin/bash</string>\n    <string>%s</string>\n    <string>start</string>\n' "$(xml_escape "$SELF")"
+    printf '  </array>\n'
+    printf '  <key>RunAtLoad</key>\n  <true/>\n'
+    printf '  <key>KeepAlive</key>\n  <false/>\n'
+    printf '  <key>AbandonProcessGroup</key>\n  <true/>\n'
+    printf '  <key>ProcessType</key>\n  <string>Background</string>\n'
+    printf '  <key>StandardOutPath</key>\n  <string>%s</string>\n' "$(xml_escape "$LOG_DIR/launchd.log")"
+    printf '  <key>StandardErrorPath</key>\n  <string>%s</string>\n' "$(xml_escape "$LOG_DIR/launchd.log")"
+    printf '  <key>EnvironmentVariables</key>\n  <dict>\n'
+    printf '    <key>PATH</key>\n    <string>%s</string>\n' \
+      "$(xml_escape "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
+    printf '    <key>IOS_WORKERS_CLI</key>\n    <string>%s</string>\n' "$(xml_escape "$AGENT")"
+    for var in IOS_WORKERS_NAME IOS_WORKERS_MODE IOS_WORKERS_MAX_DEPTH IOS_WORKERS_DETECT_DEPTH \
+               SEARCH_ROOT IOS_WORKERS_ROOT IOS_WORKERS_IDLE_TIMEOUT IOS_WORKERS_LOOP \
+               IOS_WORKERS_RESTART_DELAY IOS_WORKERS_LABEL; do
+      val="${!var:-}"
+      [ -n "$val" ] && printf '    <key>%s</key>\n    <string>%s</string>\n' "$var" "$(xml_escape "$val")"
+    done
+    printf '  </dict>\n'
+    printf '%s\n' '</dict>' '</plist>'
+  } > "$file"
+}
+
+cmd_install() {
+  check_settings; check_label; check_launchctl
+  check_agent_ready
+  local plist uid tmp
+  plist="$(plist_path)"; uid="$(id -u)"
+  mkdir -p "$LAUNCH_AGENTS_DIR" || { warn "Error: could not create $LAUNCH_AGENTS_DIR."; exit 5; }
+  ensure_dirs
+  tmp="$plist.tmp.$$"
+  write_plist "$tmp"
+  if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; warn "Error: the LaunchAgent file did not pass plutil -lint. Nothing was installed."; exit 9
+  fi
+  chmod 644 "$tmp"
+  if [ -f "$plist" ]; then
+    say "Replacing the existing LaunchAgent $LABEL."
+    "$LAUNCHCTL" bootout "gui/$uid/$LABEL" >/dev/null 2>&1
+  fi
+  mv -f "$tmp" "$plist"
+  if "$LAUNCHCTL" bootstrap "gui/$uid" "$plist"; then
+    say "Installed the LaunchAgent: $plist"
+    say "It runs \"$PROG start\" now and each time you log in. Its log is $LOG_DIR/launchd.log"
+    say "It points at this script: $SELF. If you move the script, run install again."
+  else
+    warn "Error: launchctl bootstrap failed. The file is at $plist. Run uninstall to remove it."
+    exit 9
+  fi
+}
+
+cmd_uninstall() {
+  check_label; check_launchctl
+  local plist uid
+  plist="$(plist_path)"; uid="$(id -u)"
+  "$LAUNCHCTL" bootout "gui/$uid/$LABEL" >/dev/null 2>&1
+  if [ -f "$plist" ]; then
+    rm -f "$plist"
+    say "Removed the LaunchAgent: $plist"
+  else
+    say "No LaunchAgent file found at $plist. Nothing to remove."
+  fi
+  say "Workers that are already running keep running. Run \"$PROG stop\" to stop them."
 }
 
 cmd_scan() {
@@ -467,6 +669,9 @@ main() {
     start)  cmd_start ;;
     stop)   cmd_stop ;;
     status) cmd_status ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    _run-loop) shift; run_loop "$@" ;;
     help|-h|--help) usage ;;
     *) warn "Unknown command: $1"; usage; exit 2 ;;
   esac
