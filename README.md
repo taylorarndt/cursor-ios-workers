@@ -17,7 +17,7 @@ Your other repos are not affected. Agents for them keep running in Cursor's clou
 - A Mac running macOS.
 - Xcode, or the Command Line Tools for Xcode. The script needs git from one of them.
 - The Cursor CLI, signed in to your Cursor account. Depending on how it was installed, it is called agent or cursor-agent. The script works with either.
-- A Cursor plan that includes cloud agents and My Machines. If you are on a team, a team admin may need to turn on "Allow Self-Hosted Machines" in the Cloud Agents dashboard.
+- A Cursor plan that includes cloud agents and My Machines. If you are on a team, a team admin needs to turn on "Allow personal machines" in the Cloud Agents settings of the Cursor dashboard. Without it, agents sent to your Mac are rejected with "Remote control is not enabled for this team". When we turned it on, "Enable self-hosted machines" turned on with it. Leave "Require self-hosted and personal machines" off, so your other agents keep running in the cloud.
 - Your iOS repos must have a GitHub remote.
 
 ## Install
@@ -194,7 +194,7 @@ Agents work in the checkouts already on your Mac. They don't clone or switch bra
 - If you used install, also read ~/Library/Logs/ios-workers/launchd.log.
 - Run "agent worker debug", or "cursor-agent worker debug". It checks sign-in, routing and whether Cursor can see your worker.
 - Make sure the Cursor app and the CLI use the same account.
-- If the worker log shows HTTP 502 or "rpc_unavailable" and the worker keeps retrying, the cause isn't confirmed. It may be a temporary problem on Cursor's side. It may also mean self-hosted machines aren't allowed for your team. If you are on a team, ask an admin to check the Cloud Agents settings in the Cursor dashboard for "Allow Self-Hosted Machines". If it keeps happening, check Cursor's status page or contact Cursor support, and include the output of "agent worker debug".
+- If the worker log shows HTTP 502 or "rpc_unavailable" and the worker keeps retrying, the cause isn't confirmed. It may be a temporary problem on Cursor's side. It may also mean self-hosted machines aren't allowed for your team. If you are on a team, ask an admin to check that "Allow personal machines" is on in the Cloud Agents settings of the Cursor dashboard. If it keeps happening, check Cursor's status page or contact Cursor support, and include the output of "agent worker debug".
 
 ## Official Cursor docs
 
