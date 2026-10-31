@@ -8,7 +8,7 @@ Cursor cloud agents normally run on Linux machines in Cursor's cloud. Those mach
 
 Cursor's My Machines feature fixes that. You start a small worker program on your Mac. The agent still thinks and plans in Cursor's cloud. Its terminal commands, file edits and builds run on your Mac. The worker connects out to Cursor over HTTPS. You don't need to open any ports.
 
-This script sets that up for you. It finds every iOS repo in your home folder and starts a worker for each one. Agents for those repos can then run xcodebuild, Swift tests and the Simulator on your Mac.
+This script sets that up for you. It finds every iOS repo in your home folder and starts one worker that serves all of them. Agents for those repos can then run xcodebuild, Swift tests and the Simulator on your Mac.
 
 Your other repos are not affected. Agents for them keep running in Cursor's cloud as usual.
 
@@ -71,14 +71,14 @@ Run scan again to check the result.
 
     ./ios-workers.sh start
 
-This starts one background worker for each iOS repo. If a repo already has a running worker, it doesn't start a second one.
+This starts one background worker that serves every iOS repo it found. Each repo is passed with its own --worker-dir. If the worker is already running, it doesn't start a second one.
 
 Each worker runs inside a small restart loop. The loop restarts the worker after it exits, so the worker stays available:
 
 - After an idle release. The CLI's help says a worker exits on its own after an hour with no work, so a supervisor can restart it. The script passes that hour as --idle-release-timeout 3600. Change it with IOS_WORKERS_IDLE_TIMEOUT.
 - After a crash. The loop waits a few seconds, then tries again. If the worker keeps failing within a minute, the wait doubles each time, up to 5 minutes. After 20 fast failures in a row, the loop gives up and writes that in the log.
 
-Logs go to ~/Library/Logs/ios-workers, one file per repo. Process IDs go to ~/.config/ios-workers/pids.
+The log is ~/Library/Logs/ios-workers/all-repos.log. The process ID goes to ~/.config/ios-workers/pids.
 
 ## Check the workers
 
@@ -97,7 +97,7 @@ This stops only the workers the script started, together with their restart loop
 All settings are optional environment variables.
 
 - IOS_WORKERS_NAME: the machine name. The default is your Mac's short hostname plus "-ios", in lowercase. For example, "my-macbook-pro-ios".
-- IOS_WORKERS_MODE: "per-repo" is the default. It runs one worker per repo. "single" runs one worker that serves every repo. Run stop before you switch modes.
+- IOS_WORKERS_MODE: "single" is the default. It runs one worker that serves every repo. "per-repo" is experimental. It runs one worker per repo, each with its own data folder under ~/.local/share/ios-workers and its own log. Run stop before you switch modes.
 - IOS_WORKERS_MAX_DEPTH: how many folders deep to search. The default is 6.
 - SEARCH_ROOT: the folder to search. The default is your home folder.
 - IOS_WORKERS_CLI: the full path to the Cursor CLI, if the script can't find it.
@@ -156,11 +156,13 @@ Agents work in the checkouts already on your Mac. They don't clone or switch bra
 - Leave out repos that belong to other people, and forks of public projects. Use the exclude file.
 - Don't run a worker for a repo where people you don't trust can trigger agents.
 - Never commit tokens, keys or passwords. The script never prints or saves them, and it shows only "owner/repo" instead of remote URLs. Agents can still see files on your Mac, so keep secrets out of your repos and out of build logs.
-- The script never uses sudo. It writes only to ~/.config/ios-workers and ~/Library/Logs/ios-workers, plus one plist in ~/Library/LaunchAgents if you run install.
+- The script never uses sudo. It writes only to ~/.config/ios-workers and ~/Library/Logs/ios-workers, plus one plist in ~/Library/LaunchAgents if you run install, and ~/.local/share/ios-workers in per-repo mode.
 
 ## Limits and unconfirmed points
 
-- Shared name: in per-repo mode, every worker uses the same name. Cursor's docs don't say whether several workers may share a name. If agents can't find your machine, try IOS_WORKERS_MODE=single. That mode passes every repo to one worker, which the docs describe directly.
+- One worker per data folder: on a real Mac, the CLI allowed only one worker daemon per data folder. The default data folder is ~/.local/share/cursor-agent, and it is guarded by a lock file named worker.lock. A second worker exits right away with "WorkerDaemonAlreadyRunningError: another worker daemon is already running for this data dir". That is why single mode is the default.
+- Per-repo mode is experimental. It gives each worker its own --data-dir to avoid that lock. It is not confirmed that this works, or that several workers may share one machine name.
+- Labels: "worker debug" shows that the default display name is the hostname. The script sets its own name with --name. In single mode, the first --worker-dir sets the worker's repo=owner/name label. The other repos are still served, because each gets its own --worker-dir.
 - Restarts: the restart loop keeps workers running while you are logged in. Workers stop when you log out or restart your Mac. Use install to start them again at each login, or run start yourself.
 - Idle timeout: Cursor's docs say --idle-release-timeout defaults to 0, which means no idle release. The real CLI's help says 3600. The script always passes a value, so either way works.
 - The cursor-agent name and the Homebrew location are not in Cursor's docs. They come from a real installation.
@@ -181,7 +183,7 @@ Agents work in the checkouts already on your Mac. They don't clone or switch bra
 
 3. Delete the script's folders:
 
-       rm -rf ~/.config/ios-workers ~/Library/Logs/ios-workers
+       rm -rf ~/.config/ios-workers ~/Library/Logs/ios-workers ~/.local/share/ios-workers
 
 4. Delete this repo folder if you like.
 5. To remove Cursor's sign-in from your Mac, run "agent logout" or "cursor-agent logout".
@@ -192,6 +194,7 @@ Agents work in the checkouts already on your Mac. They don't clone or switch bra
 - If you used install, also read ~/Library/Logs/ios-workers/launchd.log.
 - Run "agent worker debug", or "cursor-agent worker debug". It checks sign-in, routing and whether Cursor can see your worker.
 - Make sure the Cursor app and the CLI use the same account.
+- If the worker log shows HTTP 502 or "rpc_unavailable" and the worker keeps retrying, the cause isn't confirmed. It may be a temporary problem on Cursor's side. It may also mean self-hosted machines aren't allowed for your team. If you are on a team, ask an admin to check the Cloud Agents settings in the Cursor dashboard for "Allow Self-Hosted Machines". If it keeps happening, check Cursor's status page or contact Cursor support, and include the output of "agent worker debug".
 
 ## Official Cursor docs
 

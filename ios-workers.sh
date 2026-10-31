@@ -7,7 +7,7 @@
 #
 # Usage:
 #   ios-workers.sh scan     Dry run. Lists iOS repos that would get a worker. Changes nothing.
-#   ios-workers.sh start    Starts one background worker per iOS repo (default mode).
+#   ios-workers.sh start    Starts one background worker that serves every iOS repo.
 #   ios-workers.sh stop     Stops only the workers this script started.
 #   ios-workers.sh status   Lists the workers this script started and whether they are running.
 #   ios-workers.sh install  Adds a LaunchAgent so "start" runs each time you log in.
@@ -19,6 +19,7 @@
 #   ~/.config/ios-workers/        (exclude list you create, pid files)
 #   ~/Library/Logs/ios-workers/   (one log per worker, plus launchd.log)
 #   ~/Library/LaunchAgents/<label>.plist   (only with "install"; removed by "uninstall")
+#   ~/.local/share/ios-workers/<repo-id>/  (only in experimental per-repo mode)
 #
 # Settings (environment variables, all optional):
 #   IOS_WORKERS_NAME          Machine name the workers register as.
@@ -26,8 +27,10 @@
 #                             followed by "-ios". Example: "my-macbook-pro-ios".
 #   IOS_WORKERS_MAX_DEPTH     How deep to search $HOME for git repos. Default 6.
 #   IOS_WORKERS_DETECT_DEPTH  How deep to look inside a repo for iOS files. Default 8.
-#   IOS_WORKERS_MODE          "per-repo" (default): one worker process per repo.
-#                             "single": one worker process with every repo as a --worker-dir.
+#   IOS_WORKERS_MODE          "single" (default): one worker process with every repo as a
+#                             --worker-dir.
+#                             "per-repo" (experimental): one worker process per repo, each
+#                             with its own --data-dir under ~/.local/share/ios-workers.
 #   SEARCH_ROOT               Folder to search for repos. Default $HOME.
 #                             (IOS_WORKERS_ROOT is still accepted as an older alias.)
 #   IOS_WORKERS_CLI           Full path to the Cursor CLI. Default: the first of "agent" or
@@ -63,9 +66,14 @@
 #     so a supervisor can restart it. This script always passes the value explicitly.
 #
 # NOT CONFIRMED by the docs (design choices, test them):
-#   - Whether several worker processes may share the same --name. The docs neither allow
-#     nor forbid it. Per-repo mode does this (same name, different repo per process).
-#     If routing misbehaves, use IOS_WORKERS_MODE=single, which is clearly documented.
+#   - Found on a real Mac (CLI 2026.10.22): the CLI allows one worker daemon per data
+#     dir. The default data dir is ~/.local/share/cursor-agent, guarded by worker.lock.
+#     A second worker with the same data dir exits with WorkerDaemonAlreadyRunningError.
+#     That is why single mode is the default. Per-repo mode gives each worker its own
+#     --data-dir. Whether that works, and whether several workers may share one --name,
+#     is not confirmed.
+#   - Also seen in "worker debug": the default display name is the hostname, and the
+#     first --worker-dir sets the worker's repo=owner/name label.
 #   - The exact text and exit code of "agent status" when signed out. This script treats
 #     a non-zero exit code, or output saying "not authenticated" or "not logged in",
 #     as signed out. Its output is never printed or saved.
@@ -86,11 +94,12 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$PROG"
 ROOT="${SEARCH_ROOT:-${IOS_WORKERS_ROOT:-$HOME}}"
 MAX_DEPTH="${IOS_WORKERS_MAX_DEPTH:-6}"
 DETECT_DEPTH="${IOS_WORKERS_DETECT_DEPTH:-8}"
-MODE="${IOS_WORKERS_MODE:-per-repo}"
+MODE="${IOS_WORKERS_MODE:-single}"
 CONFIG_DIR="$HOME/.config/ios-workers"
 PID_DIR="$CONFIG_DIR/pids"
 EXCLUDE_FILE="$CONFIG_DIR/exclude"
 LOG_DIR="$HOME/Library/Logs/ios-workers"
+DATA_ROOT="$HOME/.local/share/ios-workers"   # Only used by per-repo mode.
 IDLE_TIMEOUT="${IOS_WORKERS_IDLE_TIMEOUT:-3600}"
 USE_LOOP="${IOS_WORKERS_LOOP:-1}"
 RESTART_DELAY="${IOS_WORKERS_RESTART_DELAY:-5}"
@@ -135,7 +144,7 @@ check_settings() {
   esac
   case "$MODE" in
     per-repo|single) ;;
-    *) warn "Error: IOS_WORKERS_MODE must be per-repo or single. It is set to: $MODE"; exit 2 ;;
+    *) warn "Error: IOS_WORKERS_MODE must be single or per-repo. It is set to: $MODE"; exit 2 ;;
   esac
   if [ ! -d "$ROOT" ]; then
     warn "Error: search folder does not exist: $ROOT"
@@ -597,11 +606,16 @@ cmd_start() {
   if [ "$MODE" = "single" ]; then
     args=()
     for i in "${!REPOS[@]}"; do args+=(--worker-dir "${REPOS[$i]}"); done
+    # The first --worker-dir sets the worker's repo= label. The other repos are still served.
     launch_worker "all-repos" "all repos" "$name" "${args[@]}" || failed=1
   else
+    say "Per-repo mode is experimental. Each worker gets its own data folder under $DATA_ROOT."
+    local key
     for i in "${!REPOS[@]}"; do
-      launch_worker "$(repo_key "${REPOS[$i]}")" "${REPOS[$i]}" "$name" \
-        --worker-dir "${REPOS[$i]}" || failed=$((failed + 1))
+      key="$(repo_key "${REPOS[$i]}")"
+      mkdir -p "$DATA_ROOT/$key" && chmod 700 "$DATA_ROOT" "$DATA_ROOT/$key" 2>/dev/null
+      launch_worker "$key" "${REPOS[$i]}" "$name" \
+        --data-dir "$DATA_ROOT/$key" --worker-dir "${REPOS[$i]}" || failed=$((failed + 1))
     done
   fi
   say ""
