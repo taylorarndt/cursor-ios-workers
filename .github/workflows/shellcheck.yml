@@ -1,0 +1,26 @@
+name: shellcheck
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    # GitHub-hosted cloud runner. This repo never needs a self-hosted runner.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Syntax check
+        run: bash -n ios-workers.sh
+      - name: Run shellcheck
+        # Install shellcheck only if the runner image does not already have it.
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          shellcheck --version
+          shellcheck -s bash ios-workers.sh

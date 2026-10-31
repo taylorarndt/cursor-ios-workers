@@ -1,0 +1,19 @@
+# Example exclude list for ios-workers.sh
+#
+# Copy this file to ~/.config/ios-workers/exclude and edit it:
+#   mkdir -p ~/.config/ios-workers
+#   cp exclude.example ~/.config/ios-workers/exclude
+#
+# Put one path on each line. Lines that start with # are comments. Blank lines are ignored.
+# A leading ~ means your home folder. A trailing slash is fine.
+# Listing a folder also leaves out every repo inside it.
+#
+# Leave out one repo:
+# ~/Developer/some-client-app
+#
+# Leave out a whole folder of repos, for example other people's code or forks:
+# ~/Developer/forks
+# ~/Developer/open-source
+#
+# Full paths work too:
+# /Users/yourname/Projects/experiments
